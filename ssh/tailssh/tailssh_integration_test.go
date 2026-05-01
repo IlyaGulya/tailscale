@@ -1006,6 +1006,86 @@ func TestIntegrationExitCodes(t *testing.T) {
 	}
 }
 
+// TestOpenSSHExitCodes verifies that exit codes are propagated to a real
+// OpenSSH client. This covers the client-visible behavior from #18256.
+func TestOpenSSHExitCodes(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skipf("skipping test without OpenSSH client: %v", err)
+	}
+
+	debugTest.Store(true)
+	t.Cleanup(func() { debugTest.Store(false) })
+
+	addr := testServer(t, "testuser", false, false)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exitStatus := func(t *testing.T, err error) int {
+		t.Helper()
+		if err == nil {
+			return 0
+		}
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("expected *exec.ExitError, got %T: %v", err, err)
+		}
+		return ee.ExitCode()
+	}
+
+	tests := []struct {
+		name     string
+		cmd      string
+		wantCode int
+	}{
+		{
+			name:     "success",
+			cmd:      "true",
+			wantCode: 0,
+		},
+		{
+			name:     "exit_code_passthrough",
+			cmd:      "exit 42",
+			wantCode: 42,
+		},
+		{
+			name:     "command_not_found",
+			cmd:      "/nonexistent/binary",
+			wantCode: 127,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "ssh",
+				"-F", "none",
+				"-T",
+				"-o", "BatchMode=yes",
+				"-o", "ConnectTimeout=5",
+				"-o", "GlobalKnownHostsFile=/dev/null",
+				"-o", "LogLevel=ERROR",
+				"-o", "NumberOfPasswordPrompts=0",
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				"-p", port,
+				"testuser@"+host,
+				tt.cmd,
+			)
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() == context.DeadlineExceeded {
+				t.Fatalf("ssh command timed out; output:\n%s", out)
+			}
+			if got := exitStatus(t, err); got != tt.wantCode {
+				t.Fatalf("ssh exit code = %d, want %d; output:\n%s", got, tt.wantCode, out)
+			}
+		})
+	}
+}
+
 // TestLocalUnixForwardingHalfClose verifies that the bidirectional copy
 // in Unix socket forwarding uses half-close correctly: when one direction
 // finishes, the other direction's data is not lost. This tests the bicopy
