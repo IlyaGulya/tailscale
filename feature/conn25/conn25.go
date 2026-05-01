@@ -979,6 +979,7 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 	//  * not send through the additional section
 	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
 	var answers []dnsResponseRewrite
+	var cnameChain map[dnsname.FQDN]dnsname.FQDN
 	if question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA {
 		c.logf("mapping dns response for connector domain, unsupported type: %v", question.Type)
 		newBuf, err := c.client.rewriteDNSResponse(app, hdr, questions, answers)
@@ -1008,15 +1009,32 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		}
 		switch h.Type {
 		case dnsmessage.TypeCNAME:
-			// An A record was asked for, and the answer is a CNAME, this answer will tell us which domain it's a CNAME for
-			// and a subsequent answer should tell us what the target domains address is (or possibly another CNAME). Drop
-			// this for now (2026-03-11) but in the near future we should collapse the CNAME chain and map to the ultimate
-			// destination address (see eg appc/{appconnector,observe}.go).
-			c.logf("not yet implemented CNAME answer: %v", queriedDomain)
-			if err := p.SkipAnswer(); err != nil {
+			// A DNS response with CNAME records might look a bit like
+			//
+			// a.example.com. CNAME b.example.com.
+			// b.example.com. CNAME example.com.
+			// example.com. A 1.1.1.1
+			//
+			// We don't return CNAME records for our domains. We use them to build a
+			// cname chain so we can rewrite the final A/AAAA record to eg:
+			//
+			// a.example.com A (some magic IP that is associated with 1.1.1.1)
+			r, err := p.CNAMEResource()
+			if err != nil {
 				c.logf("error parsing dns response: %v", err)
 				return makeServFail(c.logf, hdr, question)
 			}
+			src, err := normalizeDNSName(h.Name.String())
+			if err != nil {
+				c.logf("bad dnsname: %v", err)
+				return makeServFail(c.logf, hdr, question)
+			}
+			target, err := normalizeDNSName(r.CNAME.String())
+			if err != nil {
+				c.logf("bad dnsname: %v", err)
+				return makeServFail(c.logf, hdr, question)
+			}
+			mak.Set(&cnameChain, target, src)
 		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 			if h.Type != question.Type {
 				// would not expect a v4 response to a v6 question or vice versa, don't add a rewrite for this.
@@ -1026,19 +1044,38 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 				}
 				continue
 			}
-			domain, err := normalizeDNSName(h.Name.String())
+			answerDomain, err := normalizeDNSName(h.Name.String())
 			if err != nil {
 				c.logf("bad dnsname: %v", err)
 				return makeServFail(c.logf, hdr, question)
 			}
-			// answers should be for the domain that was queried
-			if domain != queriedDomain {
-				c.logf("unexpected domain for connector domain dns response: %v %v", queriedDomain, domain)
-				if err := p.SkipAnswer(); err != nil {
-					c.logf("error parsing dns response: %v", err)
-					return makeServFail(c.logf, hdr, question)
+			// If answerDomain is not the same domain as the domain that was queried for,
+			// try to walk up the cname chain until we find the queriedDomain.
+			// If we can't, skip the answer.
+			// If we can, then we will rewrite the dns response to an A/AAAA record pointing
+			// the queriedDomain to the magic IP.
+			if answerDomain != queriedDomain {
+				d := answerDomain
+				found := false
+				for {
+					parent, ok := cnameChain[d]
+					if !ok {
+						break
+					}
+					if parent == queriedDomain {
+						found = true
+						break
+					}
+					d = parent
 				}
-				continue
+				if !found {
+					c.logf("unexpected domain for connector domain dns response: %v %v", queriedDomain, answerDomain)
+					if err := p.SkipAnswer(); err != nil {
+						c.logf("error parsing dns response: %v", err)
+						return makeServFail(c.logf, hdr, question)
+					}
+					continue
+				}
 			}
 			var dstAddr netip.Addr
 			if h.Type == dnsmessage.TypeA {
@@ -1056,7 +1093,7 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 				}
 				dstAddr = netip.AddrFrom16(r.AAAA)
 			}
-			answers = append(answers, dnsResponseRewrite{domain: domain, dst: dstAddr})
+			answers = append(answers, dnsResponseRewrite{domain: queriedDomain, dst: dstAddr})
 		default:
 			// we already checked the question was for a supported type, this answer is unexpected
 			c.logf("unexpected type for connector domain dns response: %v %v", queriedDomain, h.Type)
