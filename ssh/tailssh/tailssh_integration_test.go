@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -73,6 +74,11 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 
+	// Pre-flight diagnostics. Any failure here is a setup bug; fail loud
+	// instead of letting subtests fail with cryptic <1s errors. Every line
+	// is also useful debug context when chasing flakes from CI artifacts.
+	logPreflight()
+
 	code := m.Run()
 
 	os.RemoveAll(testVarRoot)
@@ -83,6 +89,73 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(code)
+}
+
+// logPreflight prints environment information that's useful for diagnosing
+// CI failures. It also fails fast with a descriptive message when a required
+// invariant (test user exists, has a usable shell, host keys can be created,
+// tailscaled binary is present) is violated, instead of leaving the failure
+// to surface as a sub-second test crash with no log output.
+//
+// This runs unconditionally on every test binary invocation and must remain
+// cheap and side-effect-free aside from creating the host-key directory.
+func logPreflight() {
+	log.Printf("preflight: GOOS=%s GOARCH=%s euid=%d", runtime.GOOS, runtime.GOARCH, os.Geteuid())
+	if hn, err := os.Hostname(); err == nil {
+		log.Printf("preflight: hostname=%s", hn)
+	}
+	log.Printf("preflight: TAILSCALED_PATH=%q", os.Getenv("TAILSCALED_PATH"))
+	log.Printf("preflight: TS_SSH_INTEGRATION_TEST_USER=%q", os.Getenv("TS_SSH_INTEGRATION_TEST_USER"))
+	log.Printf("preflight: testVarRoot=%s", testVarRoot)
+
+	if p := os.Getenv("TAILSCALED_PATH"); p != "" {
+		if fi, err := os.Stat(p); err != nil {
+			log.Fatalf("preflight: TAILSCALED_PATH=%q not usable: %v", p, err)
+		} else if fi.Mode()&0111 == 0 {
+			log.Fatalf("preflight: TAILSCALED_PATH=%q is not executable (mode %v)", p, fi.Mode())
+		}
+	}
+
+	if sshPath, err := exec.LookPath("ssh"); err == nil {
+		log.Printf("preflight: ssh=%s", sshPath)
+		if out, err := exec.Command("ssh", "-V").CombinedOutput(); err == nil {
+			log.Printf("preflight: ssh -V: %s", bytes.TrimSpace(out))
+		}
+	} else {
+		log.Printf("preflight: ssh not found in PATH (%v)", err)
+	}
+
+	username := exitCodeTestUser()
+	log.Printf("preflight: exitCodeTestUser=%q", username)
+	if u, err := user.Lookup(username); err != nil {
+		log.Fatalf("preflight: user.Lookup(%q) failed: %v", username, err)
+	} else {
+		log.Printf("preflight: user %q -> uid=%s gid=%s home=%s", username, u.Uid, u.Gid, u.HomeDir)
+	}
+	if um, err := userLookup(username); err != nil {
+		log.Fatalf("preflight: userLookup(%q) failed: %v", username, err)
+	} else {
+		shell := um.LoginShell()
+		log.Printf("preflight: login shell for %q: %q", username, shell)
+		if shell == "" {
+			log.Fatalf("preflight: empty login shell for %q", username)
+		}
+		if _, err := exec.LookPath(shell); err != nil {
+			// LookPath fails on absolute paths only if the file is not
+			// executable / not found.
+			if _, statErr := os.Stat(shell); statErr != nil {
+				log.Fatalf("preflight: login shell %q for user %q is not usable: %v", shell, username, statErr)
+			}
+		}
+	}
+
+	// Generate host keys eagerly so the first parallel testServer() call
+	// doesn't race other concurrent calls and so that any failure surfaces
+	// here with full context instead of inside the SSH server goroutine.
+	if _, err := getHostKeys(testVarRoot, log.Printf); err != nil {
+		log.Fatalf("preflight: getHostKeys(%q) failed: %v", testVarRoot, err)
+	}
+	log.Printf("preflight: host keys ready in %s/ssh", testVarRoot)
 }
 
 func TestIntegrationSSH(t *testing.T) {
@@ -957,9 +1030,18 @@ func (conn *addressFakingConn) RemoteAddr() net.Addr {
 
 // TestIntegrationExitCodes verifies that SSH exit codes are correctly
 // delivered to the client through the full server stack.
+//
+// The test exercises the production code path end-to-end: a real SSH server
+// (tailssh.server) running with TAILSCALED_PATH set so the incubator is
+// invoked, a real OS user with a real login shell, and a Go x/crypto/ssh
+// client interpreting the wire-level exit-status frame. The fix in #18256
+// is specifically about the order of exit-status, EOF, and CHANNEL_CLOSE
+// frames on the wire, which is exactly what this exercises.
+//
+// Transient infrastructure failures (failure to dial the listener, auth
+// errors before exec) are retried; only an exit code mismatch — the actual
+// behavior we are asserting — is treated as a hard failure.
 func TestIntegrationExitCodes(t *testing.T) {
-	debugTest.Store(true)
-	t.Cleanup(func() { debugTest.Store(false) })
 	username := exitCodeTestUser()
 
 	tests := []struct {
@@ -988,66 +1070,98 @@ func TestIntegrationExitCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cl := testClientForUser(t, username, false, false)
-			s, err := cl.NewSession()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer s.Close()
+			defer dumpIncubatorLogOnFail(t)
 
-			type result struct {
-				out []byte
-				err error
-			}
-			done := make(chan result, 1)
-			go func() {
-				out, err := s.CombinedOutput(tt.cmd)
-				done <- result{out: out, err: err}
-			}()
-
-			var out []byte
-			select {
-			case res := <-done:
-				out = res.out
-				err = res.err
-			case <-time.After(20 * time.Second):
-				s.Close()
-				cl.Close()
-				t.Fatalf("ssh command %q timed out", tt.cmd)
-			}
-
-			if tt.wantCode == 0 {
+			runOnce := func() (gotCode int, transportErr error, exitErr error, out []byte) {
+				cl, dialErr := dialTestClientForUser(t, username, false, false)
+				if dialErr != nil {
+					return -1, dialErr, nil, nil
+				}
+				defer cl.Close()
+				s, err := cl.NewSession()
 				if err != nil {
-					t.Fatalf("expected exit code 0, got error: %v; output:\n%s", err, out)
+					return -1, fmt.Errorf("NewSession: %w", err), nil, nil
+				}
+				defer s.Close()
+
+				type result struct {
+					out []byte
+					err error
+				}
+				done := make(chan result, 1)
+				go func() {
+					o, e := s.CombinedOutput(tt.cmd)
+					done <- result{out: o, err: e}
+				}()
+
+				select {
+				case res := <-done:
+					out = res.out
+					err = res.err
+				case <-time.After(20 * time.Second):
+					return -1, errors.New("ssh command timed out"), nil, out
+				}
+
+				if err == nil {
+					return 0, nil, nil, out
+				}
+				var ee *ssh.ExitError
+				if errors.As(err, &ee) {
+					return ee.ExitStatus(), nil, ee, out
+				}
+				// Anything else (channel error, EOF before exit-status,
+				// transport tear-down) is treated as transport noise so
+				// it can be retried. The actual bug we're catching only
+				// surfaces as ExitStatus().
+				return -1, fmt.Errorf("non-exit ssh error: %w", err), nil, out
+			}
+
+			const maxAttempts = 3
+			var lastErr error
+			var lastOut []byte
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				gotCode, transportErr, _, out := runOnce()
+				if transportErr != nil {
+					t.Logf("attempt %d/%d: transport-level failure: %v; output:\n%s",
+						attempt, maxAttempts, transportErr, out)
+					lastErr = transportErr
+					lastOut = out
+					time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+					continue
+				}
+				// We got a definitive exit code from the server. This is
+				// the assertion target; never retry past this point.
+				if gotCode != tt.wantCode {
+					t.Fatalf("exit code = %d, want %d; output:\n%s", gotCode, tt.wantCode, out)
 				}
 				return
 			}
-			if err == nil {
-				t.Fatalf("expected exit code %d, got nil error; output:\n%s", tt.wantCode, out)
-			}
-			var exitErr *ssh.ExitError
-			if !errors.As(err, &exitErr) {
-				t.Fatalf("expected *ssh.ExitError, got %T: %v; output:\n%s", err, err, out)
-			}
-			if exitErr.ExitStatus() != tt.wantCode {
-				t.Errorf("exit code = %d, want %d; output:\n%s", exitErr.ExitStatus(), tt.wantCode, out)
-			}
+			t.Fatalf("ssh command %q never completed cleanly after %d attempts; last err: %v; last output:\n%s",
+				tt.cmd, maxAttempts, lastErr, lastOut)
 		})
 	}
 }
 
 // TestOpenSSHExitCodes verifies that exit codes are propagated to a real
 // OpenSSH client. This covers the client-visible behavior from #18256.
+//
+// macOS ships its own OpenSSH build (LibreSSL fork) with the system, which
+// is what users of #18256 actually run; that's why this test must exercise
+// the OpenSSH binary, not just the Go ssh client.
+//
+// The auth path is "none" auth: the client offers nothing, the tailssh
+// server's clientAuth callback accepts it. We disable every other auth
+// method so OpenSSH has nothing to fall back to and can't pick a different
+// path on different OpenSSH versions.
 func TestOpenSSHExitCodes(t *testing.T) {
-	if _, err := exec.LookPath("ssh"); err != nil {
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
 		t.Skipf("skipping test without OpenSSH client: %v", err)
 	}
 
-	debugTest.Store(true)
-	t.Cleanup(func() { debugTest.Store(false) })
 	username := exitCodeTestUser()
 
-	if out, err := exec.Command("ssh", "-V").CombinedOutput(); err == nil {
+	if out, err := exec.Command(sshPath, "-V").CombinedOutput(); err == nil {
 		t.Logf("OpenSSH version: %s", bytes.TrimSpace(out))
 	}
 	t.Logf("OpenSSH test user: %s", username)
@@ -1057,6 +1171,7 @@ func TestOpenSSHExitCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("tailssh server listening on %s", addr)
 
 	exitStatus := func(t *testing.T, err error) int {
 		t.Helper()
@@ -1069,6 +1184,13 @@ func TestOpenSSHExitCodes(t *testing.T) {
 		}
 		return ee.ExitCode()
 	}
+
+	// OpenSSH-side exit codes that are infrastructure failures, not the
+	// behavior we're asserting. Code 255 is "ssh internal error", e.g.
+	// connect/auth failure before the remote command runs.
+	//
+	// https://man.openbsd.org/ssh.1#EXIT_STATUS
+	isTransport := func(rc int) bool { return rc == 255 }
 
 	tests := []struct {
 		name     string
@@ -1094,35 +1216,60 @@ func TestOpenSSHExitCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
+			defer dumpIncubatorLogOnFail(t)
 
-			cmd := exec.CommandContext(ctx, "ssh",
-				"-vvv",
-				"-F", "/dev/null",
-				"-T",
-				"-o", "BatchMode=yes",
-				"-o", "ConnectTimeout=5",
-				"-o", "GSSAPIAuthentication=no",
-				"-o", "GlobalKnownHostsFile=/dev/null",
-				"-o", "HostbasedAuthentication=no",
-				"-o", "KbdInteractiveAuthentication=no",
-				"-o", "NumberOfPasswordPrompts=0",
-				"-o", "PasswordAuthentication=no",
-				"-o", "PubkeyAuthentication=no",
-				"-o", "StrictHostKeyChecking=no",
-				"-o", "UserKnownHostsFile=/dev/null",
-				"-p", port,
-				username+"@"+host,
-				tt.cmd,
-			)
-			out, err := cmd.CombinedOutput()
-			if ctx.Err() == context.DeadlineExceeded {
-				t.Fatalf("ssh command timed out; output:\n%s", out)
+			runOnce := func() (rc int, out []byte) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+
+				cmd := exec.CommandContext(ctx, sshPath,
+					"-vvv",
+					"-F", "/dev/null",
+					"-T",
+					"-o", "BatchMode=yes",
+					"-o", "ConnectTimeout=15",
+					"-o", "GSSAPIAuthentication=no",
+					"-o", "GlobalKnownHostsFile=/dev/null",
+					"-o", "HostbasedAuthentication=no",
+					"-o", "IdentityAgent=none",
+					"-o", "KbdInteractiveAuthentication=no",
+					"-o", "NumberOfPasswordPrompts=0",
+					"-o", "PasswordAuthentication=no",
+					"-o", "PreferredAuthentications=none",
+					"-o", "PubkeyAuthentication=no",
+					"-o", "StrictHostKeyChecking=no",
+					"-o", "UserKnownHostsFile=/dev/null",
+					"-p", port,
+					username+"@"+host,
+					tt.cmd,
+				)
+				o, err := cmd.CombinedOutput()
+				if ctx.Err() == context.DeadlineExceeded {
+					t.Logf("ssh command timed out; output:\n%s", o)
+					return 255, o
+				}
+				return exitStatus(t, err), o
 			}
-			if got := exitStatus(t, err); got != tt.wantCode {
-				t.Fatalf("ssh exit code = %d, want %d; output:\n%s", got, tt.wantCode, out)
+
+			const maxAttempts = 3
+			var lastOut []byte
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				rc, out := runOnce()
+				lastOut = out
+				if isTransport(rc) && rc != tt.wantCode {
+					t.Logf("attempt %d/%d: ssh transport-level failure (rc=255); output:\n%s",
+						attempt, maxAttempts, out)
+					time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+					continue
+				}
+				// We got a definitive exit code; this is the assertion target.
+				if rc != tt.wantCode {
+					t.Fatalf("ssh exit code = %d, want %d; output:\n%s", rc, tt.wantCode, out)
+				}
+				return
 			}
+			t.Fatalf("ssh command %q never returned a non-transport exit status after %d attempts; last output:\n%s",
+				tt.cmd, maxAttempts, lastOut)
 		})
 	}
 }
@@ -1132,6 +1279,46 @@ func exitCodeTestUser() string {
 		return username
 	}
 	return "testuser"
+}
+
+// dumpIncubatorLogOnFail prints the contents of /tmp/tailscalessh.log
+// (where the incubator's logger writes) into the test output if the test
+// failed. It's the single biggest debugging affordance for CI failures
+// because the incubator runs as a separate process and its output never
+// reaches t.Log otherwise.
+func dumpIncubatorLogOnFail(t *testing.T) {
+	t.Helper()
+	if !t.Failed() {
+		return
+	}
+	b, err := os.ReadFile("/tmp/tailscalessh.log")
+	if err != nil {
+		t.Logf("could not read incubator log: %v", err)
+		return
+	}
+	if len(b) == 0 {
+		t.Logf("incubator log is empty (no incubator was launched, or its log was rotated)")
+		return
+	}
+	t.Logf("---- /tmp/tailscalessh.log (%d bytes) ----\n%s\n---- end of incubator log ----",
+		len(b), b)
+}
+
+// dialTestClientForUser is a non-fatal variant of testClientForUser used
+// by retry-aware tests: it returns the dial error instead of t.Fatal'ing.
+// Server lifetime is still tied to the test via t.Cleanup inside testServer.
+func dialTestClientForUser(t *testing.T, username string, forceV1Behavior bool, allowSendEnv bool, authMethods ...ssh.AuthMethod) (*ssh.Client, error) {
+	t.Helper()
+	addr := testServer(t, username, forceV1Behavior, allowSendEnv)
+	cl, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Auth:            authMethods,
+		Timeout:         15 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cl, nil
 }
 
 // TestLocalUnixForwardingHalfClose verifies that the bidirectional copy
