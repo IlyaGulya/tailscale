@@ -1047,6 +1047,11 @@ func TestOpenSSHExitCodes(t *testing.T) {
 	t.Cleanup(func() { debugTest.Store(false) })
 	username := exitCodeTestUser()
 
+	if out, err := exec.Command("ssh", "-V").CombinedOutput(); err == nil {
+		t.Logf("OpenSSH version: %s", bytes.TrimSpace(out))
+	}
+	t.Logf("OpenSSH test user: %s", username)
+
 	addr := testServer(t, username, false, false)
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1093,13 +1098,18 @@ func TestOpenSSHExitCodes(t *testing.T) {
 			defer cancel()
 
 			cmd := exec.CommandContext(ctx, "ssh",
-				"-F", "none",
+				"-vvv",
+				"-F", "/dev/null",
 				"-T",
 				"-o", "BatchMode=yes",
 				"-o", "ConnectTimeout=5",
+				"-o", "GSSAPIAuthentication=no",
 				"-o", "GlobalKnownHostsFile=/dev/null",
-				"-o", "LogLevel=ERROR",
+				"-o", "HostbasedAuthentication=no",
+				"-o", "KbdInteractiveAuthentication=no",
 				"-o", "NumberOfPasswordPrompts=0",
+				"-o", "PasswordAuthentication=no",
+				"-o", "PubkeyAuthentication=no",
 				"-o", "StrictHostKeyChecking=no",
 				"-o", "UserKnownHostsFile=/dev/null",
 				"-p", port,
