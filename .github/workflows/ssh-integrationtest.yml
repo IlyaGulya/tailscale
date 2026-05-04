@@ -43,36 +43,13 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Create test user
-        run: |
-          set -euxo pipefail
-
-          sudo dscl . -create /Groups/groupone
-          sudo dscl . -create /Groups/groupone PrimaryGroupID 10000
-          sudo dscl . -create /Groups/groupone Password '*'
-
-          sudo dscl . -create /Groups/grouptwo
-          sudo dscl . -create /Groups/grouptwo PrimaryGroupID 10001
-          sudo dscl . -create /Groups/grouptwo Password '*'
-
-          sudo dscl . -create /Users/testuser
-          sudo dscl . -create /Users/testuser UserShell /bin/bash
-          sudo dscl . -create /Users/testuser RealName 'Test User'
-          sudo dscl . -create /Users/testuser UniqueID 10002
-          sudo dscl . -create /Users/testuser PrimaryGroupID 10000
-          sudo dscl . -create /Users/testuser NFSHomeDirectory /Users/testuser
-
-          sudo mkdir -p /Users/testuser
-          sudo chown -R testuser:groupone /Users/testuser
-          sudo chmod 0755 /Users/testuser
-
-          sudo dseditgroup -o edit -a testuser -t user groupone
-          sudo dseditgroup -o edit -a testuser -t user grouptwo
-          id testuser
       - name: Build test binaries
         run: |
           ./tool/go test -tags integrationtest -c ./ssh/tailssh -o /tmp/tailssh.test
           ./tool/go build -o /tmp/tailscaled ./cmd/tailscaled
-      - name: Run macOS SSH integration tests
+      - name: Run macOS OpenSSH exit status integration tests
         run: |
-          sudo env "PATH=$PATH" TAILSCALED_PATH=/tmp/tailscaled /tmp/tailssh.test -test.v -test.timeout=2m -test.run '^(TestOpenSSHExitCodes|TestIntegrationExitCodes)$'
+          sudo env "PATH=$PATH" TAILSCALED_PATH=/tmp/tailscaled TS_SSH_INTEGRATION_TEST_USER=runner /tmp/tailssh.test -test.v -test.timeout=3m -test.run '^TestOpenSSHExitCodes$'
+      - name: Run macOS Go SSH exit status integration tests
+        run: |
+          sudo env "PATH=$PATH" TAILSCALED_PATH=/tmp/tailscaled TS_SSH_INTEGRATION_TEST_USER=runner /tmp/tailssh.test -test.v -test.timeout=3m -test.run '^TestIntegrationExitCodes$'

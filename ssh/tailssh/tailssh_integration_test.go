@@ -731,8 +731,11 @@ readLoop:
 
 func testClient(t *testing.T, forceV1Behavior bool, allowSendEnv bool, authMethods ...ssh.AuthMethod) *ssh.Client {
 	t.Helper()
+	return testClientForUser(t, "testuser", forceV1Behavior, allowSendEnv, authMethods...)
+}
 
-	username := "testuser"
+func testClientForUser(t *testing.T, username string, forceV1Behavior bool, allowSendEnv bool, authMethods ...ssh.AuthMethod) *ssh.Client {
+	t.Helper()
 	addr := testServer(t, username, forceV1Behavior, allowSendEnv)
 
 	cl, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
@@ -957,6 +960,7 @@ func (conn *addressFakingConn) RemoteAddr() net.Addr {
 func TestIntegrationExitCodes(t *testing.T) {
 	debugTest.Store(true)
 	t.Cleanup(func() { debugTest.Store(false) })
+	username := exitCodeTestUser()
 
 	tests := []struct {
 		name     string
@@ -984,23 +988,49 @@ func TestIntegrationExitCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := testSession(t, false, false, nil)
-			err := s.Run(tt.cmd)
+			cl := testClientForUser(t, username, false, false)
+			s, err := cl.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			type result struct {
+				out []byte
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				out, err := s.CombinedOutput(tt.cmd)
+				done <- result{out: out, err: err}
+			}()
+
+			var out []byte
+			select {
+			case res := <-done:
+				out = res.out
+				err = res.err
+			case <-time.After(20 * time.Second):
+				s.Close()
+				cl.Close()
+				t.Fatalf("ssh command %q timed out", tt.cmd)
+			}
+
 			if tt.wantCode == 0 {
 				if err != nil {
-					t.Fatalf("expected exit code 0, got error: %v", err)
+					t.Fatalf("expected exit code 0, got error: %v; output:\n%s", err, out)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("expected exit code %d, got nil error", tt.wantCode)
+				t.Fatalf("expected exit code %d, got nil error; output:\n%s", tt.wantCode, out)
 			}
 			var exitErr *ssh.ExitError
 			if !errors.As(err, &exitErr) {
-				t.Fatalf("expected *ssh.ExitError, got %T: %v", err, err)
+				t.Fatalf("expected *ssh.ExitError, got %T: %v; output:\n%s", err, err, out)
 			}
 			if exitErr.ExitStatus() != tt.wantCode {
-				t.Errorf("exit code = %d, want %d", exitErr.ExitStatus(), tt.wantCode)
+				t.Errorf("exit code = %d, want %d; output:\n%s", exitErr.ExitStatus(), tt.wantCode, out)
 			}
 		})
 	}
@@ -1015,8 +1045,9 @@ func TestOpenSSHExitCodes(t *testing.T) {
 
 	debugTest.Store(true)
 	t.Cleanup(func() { debugTest.Store(false) })
+	username := exitCodeTestUser()
 
-	addr := testServer(t, "testuser", false, false)
+	addr := testServer(t, username, false, false)
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatal(err)
@@ -1072,7 +1103,7 @@ func TestOpenSSHExitCodes(t *testing.T) {
 				"-o", "StrictHostKeyChecking=no",
 				"-o", "UserKnownHostsFile=/dev/null",
 				"-p", port,
-				"testuser@"+host,
+				username+"@"+host,
 				tt.cmd,
 			)
 			out, err := cmd.CombinedOutput()
@@ -1084,6 +1115,13 @@ func TestOpenSSHExitCodes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func exitCodeTestUser() string {
+	if username := os.Getenv("TS_SSH_INTEGRATION_TEST_USER"); username != "" {
+		return username
+	}
+	return "testuser"
 }
 
 // TestLocalUnixForwardingHalfClose verifies that the bidirectional copy
