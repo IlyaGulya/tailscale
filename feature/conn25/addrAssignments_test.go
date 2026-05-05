@@ -17,7 +17,7 @@ import (
 func TestAssignmentsExpire(t *testing.T) {
 	clock := tstest.NewClock(tstest.ClockOpts{Start: time.Now()})
 	assignments := addrAssignments{clock: clock}
-	as := addrs{
+	as := &addrs{
 		dst:     netip.MustParseAddr("0.0.0.1"),
 		magic:   netip.MustParseAddr("0.0.0.2"),
 		transit: netip.MustParseAddr("0.0.0.3"),
@@ -71,9 +71,9 @@ func TestAssignmentsExpire(t *testing.T) {
 func TestPopExpired(t *testing.T) {
 	clock := tstest.NewClock(tstest.ClockOpts{Start: time.Now()})
 	assignments := addrAssignments{clock: clock}
-	makeAndAddAddrs := func(n int) addrs {
+	makeAndAddAddrs := func(n int) *addrs {
 		t.Helper()
-		as := addrs{
+		as := &addrs{
 			dst:     netip.MustParseAddr(fmt.Sprintf("0.0.1.%d", n)),
 			magic:   netip.MustParseAddr(fmt.Sprintf("0.0.2.%d", n)),
 			transit: netip.MustParseAddr(fmt.Sprintf("0.0.3.%d", n)),
@@ -87,7 +87,7 @@ func TestPopExpired(t *testing.T) {
 		return as
 	}
 	// cmp.Diff addrs ignoring expiresAt
-	doDiff := func(want, got addrs) string {
+	doDiff := func(want, got *addrs) string {
 		t.Helper()
 		return cmp.Diff(
 			want,
@@ -97,7 +97,7 @@ func TestPopExpired(t *testing.T) {
 			cmpopts.IgnoreFields(addrs{}, "expiresAt"),
 		)
 	}
-	testAddrs := []addrs{}
+	testAddrs := []*addrs{}
 	for i := range 2 {
 		testAddrs = append(testAddrs, makeAndAddAddrs(i+1))
 		clock.Advance(1 * time.Second)
@@ -107,7 +107,7 @@ func TestPopExpired(t *testing.T) {
 	}
 
 	nn := assignments.popExpired()
-	want := addrs{} // invalid addr
+	want := &addrs{} // invalid addr
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatalf("only expired addresses are removed: %s", diff)
 	}
@@ -138,7 +138,7 @@ func TestPopExpired(t *testing.T) {
 		t.Fatalf("an assignment should have been removed")
 	}
 
-	want = addrs{}
+	want = &addrs{}
 	nn = assignments.popExpired()
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatal(diff)
