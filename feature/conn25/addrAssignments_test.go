@@ -106,7 +106,7 @@ func TestPopExpired(t *testing.T) {
 		t.Fatalf("test setup wrong")
 	}
 
-	nn := assignments.popExpired()
+	nn := assignments.popExpired(clock.Now())
 	want := &addrs{} // invalid addr
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatalf("only expired addresses are removed: %s", diff)
@@ -121,7 +121,7 @@ func TestPopExpired(t *testing.T) {
 	clock.Advance(2 * defaultExpiry) // all addrs are now expired
 
 	want = testAddrs[0]
-	nn = assignments.popExpired()
+	nn = assignments.popExpired(clock.Now())
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatal(diff)
 	}
@@ -130,7 +130,7 @@ func TestPopExpired(t *testing.T) {
 	}
 
 	want = testAddrs[1]
-	nn = assignments.popExpired()
+	nn = assignments.popExpired(clock.Now())
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatal(diff)
 	}
@@ -139,7 +139,7 @@ func TestPopExpired(t *testing.T) {
 	}
 
 	want = &addrs{}
-	nn = assignments.popExpired()
+	nn = assignments.popExpired(clock.Now())
 	if diff := doDiff(want, nn); diff != "" {
 		t.Fatal(diff)
 	}

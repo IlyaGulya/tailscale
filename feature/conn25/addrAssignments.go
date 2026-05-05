@@ -94,11 +94,11 @@ func (a *addrAssignments) lookupByTransitIP(tip netip.Addr) (*addrs, bool) {
 
 // popExpired returns the member of addrAssignments that expired earliest,
 // or an invalid addrs if there are no expired members of addrAssignments.
-func (a *addrAssignments) popExpired() *addrs {
+func (a *addrAssignments) popExpired(now time.Time) *addrs {
 	if a.byExpiresAt.Len() == 0 {
 		return &addrs{}
 	}
-	if !a.byExpiresAt.peek().expiresAt.Before(a.clock.Now()) {
+	if !a.byExpiresAt.peek().expiresAt.Before(now) {
 		return &addrs{}
 	}
 	v := heap.Pop(&a.byExpiresAt).(*addrs)

@@ -763,8 +763,9 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 	// addresses used to trend down in general. But as we have 2 different
 	// pools for the different IP versions, use a number a bit higher than
 	// 2 to try and process bursty behavior faster.
+	now := c.assignments.clock.Now()
 	for range 10 {
-		a := c.assignments.popExpired()
+		a := c.assignments.popExpired(now)
 		if !a.isValid() {
 			break
 		}
