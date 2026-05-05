@@ -24,7 +24,7 @@ type domainDst struct {
 // addrAssignments is the collection of addrs assigned by this client
 // supporting lookup by magic IP, transit IP or domain+dst, or to lookup all
 // transit IPs associated with a given connector (identified by its node key).
-// byConnKey stores netip.Prefix versions of the transit IPs for use in the
+// byConnKey stores [netip.Prefix] versions of the transit IPs for use in the
 // WireGuard hooks.
 type addrAssignments struct {
 	byMagicIP   map[netip.Addr]addrs
