@@ -774,6 +774,8 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 		} else if a.is6() {
 			c.v6MagicIPPool.returnAddr(a.magic)
 			c.v6TransitIPPool.returnAddr(a.transit)
+		} else {
+			return addrs{}, errors.New("unexpected neither 4 nor 6")
 		}
 	}
 
