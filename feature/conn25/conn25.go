@@ -1225,8 +1225,8 @@ type addrs struct {
 	expiresAt time.Time
 }
 
-func (c addrs) isValid() bool {
-	return c.dst.IsValid()
+func (as addrs) isValid() bool {
+	return as.dst.IsValid()
 }
 
 func (as addrs) is4() bool {
